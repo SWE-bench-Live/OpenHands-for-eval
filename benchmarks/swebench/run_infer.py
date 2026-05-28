@@ -8,6 +8,7 @@ from benchmarks.swebench import constants
 from benchmarks.swebench.build_images import (
     extract_custom_tag,
     get_official_docker_image,
+    should_wrap_custom_tag,
     should_wrap_instance_id,
     wrap_image,
 )
@@ -92,7 +93,12 @@ def get_instruction(
     workspace_path: str,
 ) -> str:
     """Generate instruction for the agent."""
-    workspace_dir_name = instance["repo"].split("/")[-1]
+    repo_name = str(
+        instance.get("repo")
+        or instance.get("repo_name")
+        or instance["instance_id"].split("__")[0]
+    )
+    workspace_dir_name = repo_name.split("/")[-1]
     assert metadata.details is not None
 
     # Set up Jinja2 environment
@@ -128,16 +134,26 @@ class SWEBenchEvaluation(Evaluation):
     """
 
     def get_official_docker_image(self, instance: EvalInstance) -> str:
+        dataset_image = instance.data.get("image_name") or instance.data.get("docker_image")
+        if dataset_image:
+            return str(dataset_image)
         return get_official_docker_image(instance.id)
 
     def extract_custom_tag(self, official_docker_image: str) -> str:
         return extract_custom_tag(official_docker_image)
 
     def should_wrap_instance(self, instance: EvalInstance) -> bool:
+        dataset_image = instance.data.get("image_name") or instance.data.get("docker_image")
+        if dataset_image:
+            return should_wrap_custom_tag(self.extract_custom_tag(str(dataset_image)))
         return should_wrap_instance_id(instance.id)
 
     def get_source_repo_path(self, instance: EvalInstance) -> str:
-        return "/testbed"
+        return str(
+            instance.data.get("working_dir")
+            or instance.data.get("source_repo_path")
+            or "/testbed"
+        )
 
     def prepare_instances(self) -> List[EvalInstance]:
         logger.info("Setting up SWE-bench evaluation data")
@@ -152,7 +168,12 @@ class SWEBenchEvaluation(Evaluation):
         instances: List[EvalInstance] = []
         for _, row in df.iterrows():
             inst_id = str(row["instance_id"])
-            instances.append(EvalInstance(id=inst_id, data=row.to_dict()))
+            data = row.to_dict()
+            data.setdefault("instance_id", inst_id)
+            data.setdefault("repo", str(data.get("repo_name") or inst_id.split("__")[0]))
+            if "problem_statement" not in data and "description" in data:
+                data["problem_statement"] = data["description"]
+            instances.append(EvalInstance(id=inst_id, data=data))
 
         logger.info("Total instances to process: %d", len(instances))
         return instances
@@ -325,7 +346,12 @@ class SWEBenchEvaluation(Evaluation):
 
         setup_acp_workspace(self.metadata.agent_type, workspace)
 
-        repo_path = f"/workspace/{instance.data['repo'].split('/')[-1]}/"
+        repo_name = str(
+            instance.data.get("repo")
+            or instance.data.get("repo_name")
+            or instance.id.split("__")[0]
+        )
+        repo_path = f"/workspace/{repo_name.split('/')[-1]}/"
         instance.data["repo_path"] = repo_path
 
         persist_callback = build_event_persistence_callback(

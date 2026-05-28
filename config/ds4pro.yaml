@@ -1,0 +1,17 @@
+model:
+  model: azure/DeepSeek-V4-Pro
+  api_base: https://cloudgpt-openai.azure-api.net/
+  api_version: 2025-04-01-preview
+  max_output_tokens: 64000
+  reasoning_effort: none
+
+agent:
+  max_iterations: 100
+  timeout: 300
+  num_workers: 1
+  workspace: docker
+  output_dir: logs
+  tool_preset: default
+  enable_condenser: true
+  condenser_max_size: 240
+  condenser_keep_first: 2
