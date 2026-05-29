@@ -1071,6 +1071,30 @@ def test_llm_reset_metrics():
     assert llm.metrics.accumulated_cost == 0.0
 
 
+def test_llm_reset_metrics_preserves_telemetry_callbacks():
+    """Resetting shared metrics must keep remote telemetry streaming callbacks."""
+    llm = LLM(
+        model="gpt-4o",
+        api_key=SecretStr("test-key"),
+        usage_id="test-llm",
+    )
+
+    def stats_callback() -> None:
+        pass
+
+    def log_callback(_filename: str, _log_data: str) -> None:
+        pass
+
+    llm.telemetry.set_stats_update_callback(stats_callback)
+    llm.telemetry.set_log_completions_callback(log_callback)
+
+    llm.reset_metrics()
+
+    assert llm.telemetry._stats_update_callback is stats_callback
+    assert llm.telemetry._log_completions_callback is log_callback
+    assert llm.telemetry.metrics is llm.metrics
+
+
 def test_issue_2459_restore_metrics_syncs_telemetry():
     """Restore metrics must update telemetry's reference to avoid desync.
 

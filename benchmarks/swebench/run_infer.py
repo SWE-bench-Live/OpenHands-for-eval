@@ -1,8 +1,10 @@
 import json
 import os
+import shlex
 from typing import Any, List
 
 from jinja2 import Environment, FileSystemLoader
+from pydantic import SecretStr
 
 from benchmarks.swebench import constants
 from benchmarks.swebench.build_images import (
@@ -45,7 +47,7 @@ from benchmarks.utils.models import (
     ToolPresetType,
 )
 from benchmarks.utils.version import get_phased_image_tag_prefix
-from openhands.sdk import Agent, Conversation, Tool, get_logger
+from openhands.sdk import LLM, Agent, Conversation, Tool, get_logger
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.workspace import RemoteWorkspace
@@ -54,6 +56,23 @@ from openhands.workspace import APIRemoteWorkspace, ApptainerWorkspace, DockerWo
 
 
 logger = get_logger(__name__)
+
+
+def _with_fresh_azure_ad_token(llm: LLM, instance_id: str) -> LLM:
+    if not llm.model.startswith("azure") or llm.api_key is not None:
+        return llm
+
+    from cloudgpt_aoai import get_openai_token_provider
+
+    logger.info("Acquiring fresh host Azure AD token for %s", instance_id)
+    azure_ad_token = get_openai_token_provider()()
+    if not azure_ad_token:
+        raise RuntimeError(f"Failed to acquire Azure AD token for {instance_id}")
+
+    return llm.model_copy(
+        deep=True,
+        update={"azure_ad_token": SecretStr(azure_ad_token)},
+    )
 
 
 def get_tools_for_preset(
@@ -315,6 +334,7 @@ class SWEBenchEvaluation(Evaluation):
             agent = build_acp_agent(self.metadata.agent_type, self.metadata.llm.model)
         else:
             agent_llm = build_eval_llm(self.metadata.llm)
+            agent_llm = _with_fresh_azure_ad_token(agent_llm, instance.id)
             tools = get_tools_for_preset(
                 preset=self.metadata.tool_preset,
                 # Disable browser tools in CLI mode
@@ -370,8 +390,17 @@ class SWEBenchEvaluation(Evaluation):
 
         logger.info("repo_path: %s", repo_path)
         source_repo_path = self.get_source_repo_path(instance)
+        quoted_repo_path = shlex.quote(repo_path)
+        quoted_source_repo_path = shlex.quote(source_repo_path.rstrip("/"))
         cp_testbed_repo = workspace.execute_command(
-            f"mkdir -p {repo_path} ; cp -r {source_repo_path}/. {repo_path}"
+            " && ".join(
+                [
+                    f"mkdir -p {quoted_repo_path}",
+                    f"sudo cp -a {quoted_source_repo_path}/. {quoted_repo_path}",
+                    f"sudo chown -R $(id -u):$(id -g) {quoted_repo_path}",
+                    f"sudo chmod -R u+rwX {quoted_repo_path}",
+                ]
+            )
         )
         assert cp_testbed_repo.exit_code == 0, (
             f"cp_testbed_repo failed: {cp_testbed_repo.stderr}"
@@ -386,34 +415,54 @@ class SWEBenchEvaluation(Evaluation):
             metadata=self.metadata,
             workspace_path=workspace.working_dir,
         )
+        run_error: Exception | None = None
         with workspace_keepalive(self.metadata.agent_type, workspace):
-            conversation.send_message(instruction)
-            # Run conversation with fake user responses to handle agent messages
-            run_conversation_with_fake_user_response(conversation)
+            try:
+                conversation.send_message(instruction)
+                # Run conversation with fake user responses to handle agent messages
+                run_conversation_with_fake_user_response(conversation)
+            except Exception as exc:
+                run_error = exc
+                logger.warning(
+                    "Conversation for %s ended with error; preserving partial patch: %s",
+                    instance.id,
+                    exc,
+                )
 
-        # git add
-        workspace.execute_command(f"cd {repo_path} ; git add -A")
+        status = getattr(conversation.state, "execution_status", None)
+        status_value = getattr(status, "value", str(status)).lower()
+        if run_error is None and status_value in {"error", "stuck"}:
+            run_error = RuntimeError(f"Conversation ended with status {status_value}")
 
-        # git commit
-        # Use --no-verify to bypass pre-commit hooks (e.g., husky) that can fail
-        workspace.execute_command(
-            f"cd {repo_path} && "
-            f"git config --global user.email '{constants.GIT_USER_EMAIL}' && "
-            f"git config --global user.name '{constants.GIT_USER_NAME}' && "
-            f"git commit --no-verify -m '{constants.GIT_COMMIT_MESSAGE}'"
-        )
+        patch_error: str | None = None
 
-        # Get git patch
+        git_add = workspace.execute_command(f"cd {repo_path} ; git add -A")
+        if git_add.exit_code != 0:
+            patch_error = f"git add failed: {git_add.stderr}"
+            logger.warning("%s: %s", instance.id, patch_error)
+
+        if patch_error is None:
+            commit_result = workspace.execute_command(
+                f"cd {repo_path} && "
+                f"git config --global user.email '{constants.GIT_USER_EMAIL}' && "
+                f"git config --global user.name '{constants.GIT_USER_NAME}' && "
+                f"git commit --no-verify -m '{constants.GIT_COMMIT_MESSAGE}'"
+            )
+            if commit_result.exit_code != 0:
+                patch_error = f"git commit failed: {commit_result.stderr}"
+                logger.warning("%s: %s", instance.id, patch_error)
+
         base_commit = instance.data["base_commit"]
         git_patch_result = workspace.execute_command(
-            (f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD")
+            f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD --"
         )
-        assert git_patch_result.exit_code == 0, (
-            f"git diff failed: {git_patch_result.stderr}"
-        )
-        git_patch = git_patch_result.stdout
+        if git_patch_result.exit_code == 0:
+            git_patch = git_patch_result.stdout
+        else:
+            git_patch = ""
+            patch_error = f"git diff failed: {git_patch_result.stderr}"
+            logger.warning("%s: %s", instance.id, patch_error)
 
-        # Log instance summary
         summarize_instance(
             instance_id=instance.id,
             conversation=conversation,
@@ -421,20 +470,26 @@ class SWEBenchEvaluation(Evaluation):
             logger=logger,
         )
 
-        # Build test_result with git patch and optional ACP agent metadata
         test_result: dict[str, Any] = {
             "git_patch": git_patch,
         }
         if isinstance(agent, ACPAgent):
             add_acp_agent_metadata(test_result, conversation)
 
-        # EvalOutput is your model; keep fields consistent with prior JSONL
+        error = None
+        if run_error is not None:
+            error = str(run_error)
+        if patch_error is not None:
+            error = f"{error}; {patch_error}" if error else patch_error
+        if error is not None:
+            error = error[:200]
+
         out = EvalOutput(
             instance_id=instance.id,
             attempt=self.current_attempt,
             test_result=test_result,
             instruction=instruction,
-            error=None,
+            error=error,
             history=list(conversation.state.events),
             metrics=conversation.conversation_stats.get_combined_metrics(),
         )

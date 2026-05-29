@@ -6,7 +6,6 @@ import os
 from typing import Callable
 
 from benchmarks.utils.models import EvalInstance, EvalOutput
-from benchmarks.utils.version import SDK_SHORT_SHA
 from openhands.sdk import get_logger
 
 
@@ -25,7 +24,7 @@ def construct_eval_output_dir(
     # <llm>_sdk_<sdk_short_sha>_maxiter_<maxiter>_N_<user_note>/
 
     # Create LLM config string
-    folder = f"{model_name}_sdk_{SDK_SHORT_SHA}_maxiter_{max_iterations}"
+    folder = f"{model_name}_sdk_maxiter_{max_iterations}"
     if eval_note:
         folder += f"_N_{eval_note}"
 
@@ -42,8 +41,8 @@ def get_default_on_result_writer(
     """
     Create a default callback that writes evaluation results to JSONL files.
 
-    Successful results are written to output.jsonl.
-    Failed results (with error field) are written to output_errors.jsonl.
+    All results are written to output.jsonl.
+    Failed results (with error field) are also written to output_errors.jsonl.
 
     Args:
         output_path: Path to the main output JSONL file
@@ -54,15 +53,17 @@ def get_default_on_result_writer(
     # Derive error output path from main output path
     error_output_path = output_path.replace(".jsonl", "_errors.jsonl")
 
-    def _cb(instance: EvalInstance, out: EvalOutput) -> None:
-        # Choose the appropriate file based on whether there's an error
-        target_path = error_output_path if out.error else output_path
-
-        with open(target_path, "a") as f:
+    def _write_jsonl(path: str, out: EvalOutput) -> None:
+        with open(path, "a") as f:
             # Use exclusive lock to prevent race conditions in parallel execution
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(out.model_dump_json() + "\n")
             fcntl.flock(f, fcntl.LOCK_UN)
+
+    def _cb(instance: EvalInstance, out: EvalOutput) -> None:
+        _write_jsonl(output_path, out)
+        if out.error:
+            _write_jsonl(error_output_path, out)
 
     return _cb
 

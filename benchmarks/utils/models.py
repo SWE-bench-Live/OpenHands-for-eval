@@ -50,7 +50,7 @@ class EvalMetadata(BaseModel):
         "(one per line)",
     )
     max_retries: int = Field(
-        default=3,
+        default=0,
         ge=0,
         description="Maximum number of retries for instances that throw exceptions",
     )

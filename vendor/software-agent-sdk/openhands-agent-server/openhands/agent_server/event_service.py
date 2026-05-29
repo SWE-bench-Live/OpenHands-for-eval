@@ -571,9 +571,16 @@ class EventService:
             # Start run in background
             loop = asyncio.get_running_loop()
 
+            def _run_conversation_with_stats_streaming():
+                conversation._ensure_agent_ready()
+                self._setup_stats_streaming(conversation.agent)
+                conversation.run()
+
             async def _run_and_publish():
                 try:
-                    await loop.run_in_executor(None, conversation.run)
+                    await loop.run_in_executor(
+                        None, _run_conversation_with_stats_streaming
+                    )
                 except Exception:
                     logger.exception("Error during conversation run")
                 finally:

@@ -67,8 +67,8 @@ def get_parser(add_llm_config: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--n-critic-runs",
         type=int,
-        default=3,
-        help="Number of critic evaluation runs for iterative mode (default: 3, min: 1)",
+        default=1,
+        help="Number of critic evaluation runs for iterative mode (default: 1, min: 1)",
     )
 
     # Add critic arguments (no default)
@@ -82,8 +82,8 @@ def get_parser(add_llm_config: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=3,
-        help="Maximum retries for instances that throw exceptions (default: 3)",
+        default=0,
+        help="Maximum retries for instances that throw exceptions (default: 0)",
     )
     parser.add_argument(
         "--tool-preset",

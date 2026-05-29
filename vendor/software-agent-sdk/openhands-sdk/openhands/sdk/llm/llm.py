@@ -184,6 +184,10 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         default=None,
         description="API version (e.g., Azure).",
     )
+    azure_ad_token: str | SecretStr | None = Field(
+        default=None,
+        description="Azure AD bearer token for Azure OpenAI authentication.",
+    )
 
     aws_access_key_id: str | SecretStr | None = Field(
         default=None,
@@ -473,7 +477,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         return v
 
     @field_validator(
-        "api_key", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"
+        "api_key",
+        "azure_ad_token",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
     )
     @classmethod
     def _validate_secrets(cls, v: str | SecretStr | None, info) -> SecretStr | None:
@@ -591,6 +599,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     # =========================================================================
     @field_serializer(
         "api_key",
+        "azure_ad_token",
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
@@ -673,11 +682,26 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         When an LLM is copied (e.g., to create a condenser LLM from an agent LLM),
         Pydantic's model_copy() does a shallow copy of private attributes by default,
         causing the original and copied LLM to share the same Metrics object.
-        This method allows the registry to fix this by resetting metrics to None,
-        which will be lazily recreated when accessed.
+        This method allows the registry to fix this by resetting metrics while
+        preserving telemetry callbacks registered by the remote agent server.
         """
-        self._metrics = None
-        self._telemetry = None
+        stats_update_callback = None
+        log_completions_callback = None
+        if self._telemetry is not None:
+            stats_update_callback = self._telemetry._stats_update_callback
+            log_completions_callback = self._telemetry._log_completions_callback
+
+        self._metrics = Metrics(model_name=self.model)
+        self._telemetry = Telemetry(
+            model_name=self.model,
+            log_enabled=self.log_completions,
+            log_dir=self.log_completions_folder if self.log_completions else None,
+            input_cost_per_token=self.input_cost_per_token,
+            output_cost_per_token=self.output_cost_per_token,
+            metrics=self._metrics,
+        )
+        self._telemetry.set_stats_update_callback(stats_update_callback)
+        self._telemetry.set_log_completions_callback(log_completions_callback)
 
     def _handle_error(
         self,
@@ -1103,11 +1127,24 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         return api_key_value
 
+    def _get_azure_ad_token_value(self) -> str | None:
+        if not self.azure_ad_token:
+            return None
+        assert isinstance(self.azure_ad_token, SecretStr)
+        return self.azure_ad_token.get_secret_value()
+
     def _azure_ad_token_provider_kwargs(
         self, api_key_value: str | None
-    ) -> dict[str, Callable[[], str]]:
+    ) -> dict[str, str | Callable[[], str]]:
         """Return LiteLLM kwargs for Azure AD auth when no API key is configured."""
-        if api_key_value is not None or not self.model.startswith("azure"):
+        if not self.model.startswith("azure"):
+            return {}
+
+        azure_ad_token = self._get_azure_ad_token_value()
+        if azure_ad_token is not None:
+            return {"azure_ad_token": azure_ad_token}
+
+        if api_key_value is not None:
             return {}
 
         if self._azure_ad_token_provider is None:

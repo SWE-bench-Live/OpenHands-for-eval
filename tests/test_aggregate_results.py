@@ -196,15 +196,10 @@ class TestAggregateResults:
         instance_ids = {json.loads(line)["instance_id"] for line in lines}
         assert instance_ids == {"instance_1", "instance_2", "instance_3"}
 
-    def test_all_attempts_error_instance_dropped(self, temp_output_dir):
-        """
-        Test that instances where all attempts error are correctly dropped.
-
-        If all attempts have errors, the instance should not appear in output.jsonl.
-        """
+    def test_all_attempts_error_instance_preserved(self, temp_output_dir):
+        """Instances where all attempts error should still appear in output.jsonl."""
         critic = PassCritic()
 
-        # All attempts error
         for attempt in range(1, 4):
             attempt_file = os.path.join(
                 temp_output_dir, f"output.critic_attempt_{attempt}.jsonl"
@@ -213,15 +208,16 @@ class TestAggregateResults:
             with open(attempt_file, "w") as f:
                 f.write(output.model_dump_json() + "\n")
 
-        # Run aggregation
         aggregate_results(temp_output_dir, n_critic_runs=3, critic=critic)
 
-        # Verify output.jsonl is empty (instance dropped because all attempts errored)
         final_output_file = os.path.join(temp_output_dir, "output.jsonl")
         with open(final_output_file, "r") as f:
             lines = f.readlines()
 
-        assert len(lines) == 0, "Instance with all error attempts should be dropped"
+        assert len(lines) == 1
+        result = json.loads(lines[0])
+        assert result["instance_id"] == "instance_1"
+        assert result["error"] is not None
 
     def test_empty_attempts(self, temp_output_dir):
         """Test aggregation when no attempt files exist."""

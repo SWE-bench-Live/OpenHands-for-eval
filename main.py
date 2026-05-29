@@ -44,11 +44,17 @@ def _agent_defaults(config: dict[str, Any]) -> dict[str, Any]:
         if old in agent and new not in agent:
             agent[new] = agent.pop(old)
 
+    if agent.pop("max_attempt", None) == 1:
+        agent["n_critic_runs"] = 1
+        agent["max_retries"] = 0
+
     # Keep the command compact for local SWE-Live JSONL runs.
     agent.setdefault("workspace", "docker")
     agent.setdefault("num_workers", 1)
     agent.setdefault("max_iterations", 100)
     agent.setdefault("output_dir", "logs")
+    agent.setdefault("n_critic_runs", 1)
+    agent.setdefault("max_retries", 0)
     return agent
 
 
@@ -135,10 +141,10 @@ def main(argv: list[str] | None = None) -> None:
         env_setup_commands=agent_defaults.get(
             "env_setup_commands", ["export PIP_CACHE_DIR=~/.cache/pip"]
         ),
-        n_critic_runs=args.n_critic_runs,
+        n_critic_runs=1,
         critic=critic,
         selected_instances_file=args.select,
-        max_retries=args.max_retries,
+        max_retries=0,
         workspace_type=args.workspace,
         tool_preset=args.tool_preset,
         enable_delegation=args.enable_delegation,

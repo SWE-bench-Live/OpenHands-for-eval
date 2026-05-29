@@ -10,8 +10,10 @@ concurrency for I/O-bound workloads (HTTP calls to LLM proxy + runtime API).
 
 import asyncio
 import base64
+import io
 import json
 import os
+import shutil
 import tarfile
 import threading
 import time
@@ -29,9 +31,8 @@ from tqdm import tqdm
 
 from benchmarks.utils.acp import is_acp_agent
 from benchmarks.utils.constants import OUTPUT_FILENAME
-from benchmarks.utils.critics import get_completed_instances
 from benchmarks.utils.failure_classifier import FailureCategory, classify_failure
-from benchmarks.utils.iterative import aggregate_results, get_failed_instances
+from benchmarks.utils.iterative import aggregate_results
 from benchmarks.utils.laminar import LMNR_ENV_VARS, LaminarEvalMetadata, LaminarService
 from benchmarks.utils.litellm_proxy import (
     create_virtual_key,
@@ -157,6 +158,18 @@ class Evaluation(ABC, BaseModel):
 
     def model_post_init(self, __context) -> None:
         """Stamp openhands_sdk_version on self.metadata and persist metadata.json."""
+        if self.metadata.n_critic_runs != 1:
+            logger.warning(
+                "Forcing n_critic_runs from %d to 1; retries are disabled",
+                self.metadata.n_critic_runs,
+            )
+            self.metadata.n_critic_runs = 1
+        if self.metadata.max_retries != 0:
+            logger.warning(
+                "Forcing max_retries from %d to 0; retries are disabled",
+                self.metadata.max_retries,
+            )
+            self.metadata.max_retries = 0
         self.metadata.openhands_sdk_version = openhands_sdk_version
         self._save_metadata()
 
@@ -193,19 +206,46 @@ class Evaluation(ABC, BaseModel):
     def output_path(self) -> str:
         return os.path.join(self.metadata.eval_output_dir, OUTPUT_FILENAME)
 
-    def _get_completed_instances(self) -> set[EvalInstanceID]:
-        """Return the set of completed instance IDs."""
+    def _trajectory_exists(self, instance_id: str) -> bool:
+        trajectory_path = (
+            Path(self.metadata.eval_output_dir)
+            / "conversations"
+            / instance_id
+            / "trajectory.jsonl"
+        )
+        return trajectory_path.is_file() and trajectory_path.stat().st_size > 0
+
+    def _instances_with_non_empty_patch_and_trajectory(self) -> set[EvalInstanceID]:
         completed_instances: set[EvalInstanceID] = set()
         if os.path.exists(self.output_path):
             with open(self.output_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    out = json.loads(line)
-                    completed_instances.add(out["instance_id"])
+                for line_num, line in enumerate(f, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        out = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(
+                            "Invalid JSON on line %d in %s: %s",
+                            line_num,
+                            self.output_path,
+                            exc,
+                        )
+                        continue
+                    instance_id = out.get("instance_id")
+                    patch = (out.get("test_result") or {}).get("git_patch") or ""
+                    if instance_id and patch.strip() and self._trajectory_exists(instance_id):
+                        completed_instances.add(instance_id)
             logger.info(
-                f"Found {len(completed_instances)} completed instances "
-                f"in {self.output_path}"
+                "Found %d restart-complete instances in %s",
+                len(completed_instances),
+                self.output_path,
             )
         return completed_instances
+
+    def _get_completed_instances(self) -> set[EvalInstanceID]:
+        """Return instances safe to skip on restart."""
+        return self._instances_with_non_empty_patch_and_trajectory()
 
     @abstractmethod
     def prepare_instances(self) -> List[EvalInstance]:
@@ -239,7 +279,15 @@ class Evaluation(ABC, BaseModel):
         self,
         conversation_archive_path: Path,
     ) -> dict[str, Any] | None:
-        """Load the archived conversation base_state.json payload."""
+        """Load the persisted conversation base_state.json payload."""
+        if conversation_archive_path.is_dir():
+            base_state_path = next(
+                conversation_archive_path.rglob("base_state.json"), None
+            )
+            if base_state_path is None:
+                return None
+            return json.loads(base_state_path.read_text())
+
         with tarfile.open(conversation_archive_path, mode="r:gz") as conv_tar:
             base_state_file = next(
                 (
@@ -257,6 +305,35 @@ class Evaluation(ABC, BaseModel):
                 return None
 
             return json.loads(base_state_obj.read().decode("utf-8"))
+
+    def _safe_extract_tar(self, conv_tar: tarfile.TarFile, target_dir: Path) -> None:
+        """Extract a tar into target_dir without allowing path traversal."""
+        target_root = target_dir.resolve()
+        for member in conv_tar.getmembers():
+            member_path = (target_dir / member.name).resolve()
+            if member_path != target_root and target_root not in member_path.parents:
+                raise RuntimeError(f"Unsafe conversation archive member: {member.name}")
+        conv_tar.extractall(target_dir, filter="data")
+
+    def _write_trajectory_files(self, conversation_dir: Path) -> tuple[Path, Path] | None:
+        """Write persisted event JSON files to JSON and JSONL trajectory files."""
+        event_paths = sorted(conversation_dir.rglob("events/event-*.json"))
+        if not event_paths:
+            return None
+
+        events: list[Any] = []
+        for event_path in event_paths:
+            events.append(json.loads(event_path.read_text()))
+
+        json_path = conversation_dir / "trajectory.json"
+        jsonl_path = conversation_dir / "trajectory.jsonl"
+        with json_path.open("w", encoding="utf-8") as out_file:
+            json.dump(events, out_file, indent=2)
+        with jsonl_path.open("w", encoding="utf-8") as out_file:
+            for event in events:
+                out_file.write(json.dumps(event))
+                out_file.write("\n")
+        return json_path, jsonl_path
 
     def _has_meaningful_metrics(self, metrics: Metrics) -> bool:
         """Return whether recovered metrics contain non-zero cost or usage."""
@@ -278,7 +355,7 @@ class Evaluation(ABC, BaseModel):
         self,
         conversation_archive_path: Path | None,
     ) -> Metrics | None:
-        """Recover aggregated metrics from a saved conversation archive."""
+        """Recover aggregated metrics from a saved conversation path."""
         if conversation_archive_path is None or not conversation_archive_path.exists():
             return None
 
@@ -366,7 +443,7 @@ class Evaluation(ABC, BaseModel):
         """Capture conversation trajectory from the remote runtime.
 
         Persists the /workspace/conversations directory from the remote runtime
-        to a per-instance tar.gz file in the evaluation output directory.
+        to plain per-instance files in the evaluation output directory.
 
         This provides a complete record of the agent's conversation history,
         which is valuable for debugging, analysis, and reproducibility.
@@ -376,7 +453,8 @@ class Evaluation(ABC, BaseModel):
             instance: The evaluation instance being processed
         """
         try:
-            # Create command to tar and base64 encode the conversations directory
+            # Tar is only used as an internal transfer format from the container.
+            # The saved artifact is an extracted directory of plain JSON files.
             conv_cmd = (
                 "cd / && "
                 "if [ -d workspace/conversations ]; then "
@@ -386,24 +464,37 @@ class Evaluation(ABC, BaseModel):
             tar_cmd = workspace.execute_command(conv_cmd)
 
             if tar_cmd.exit_code == 0 and tar_cmd.stdout.strip():
-                # Save to instance-specific file to support parallel execution
                 conversations_dir = (
                     Path(self.metadata.eval_output_dir) / "conversations"
                 )
                 conversations_dir.mkdir(parents=True, exist_ok=True)
-                conv_tar_path = conversations_dir / f"{instance.id}.tar.gz"
+                conversation_dir = conversations_dir / instance.id
 
-                # Decode and write the tar.gz file
-                conv_tar_path.write_bytes(base64.b64decode(tar_cmd.stdout))
+                if conversation_dir.exists():
+                    shutil.rmtree(conversation_dir)
+                conversation_dir.mkdir(parents=True)
+
+                tar_bytes = base64.b64decode(tar_cmd.stdout)
+                with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as conv_tar:
+                    self._safe_extract_tar(conv_tar, conversation_dir)
+                trajectory_paths = self._write_trajectory_files(conversation_dir)
+
                 logger.info(
-                    "[worker] Saved conversation archive for %s to %s",
+                    "[worker] Saved conversation files for %s to %s",
                     instance.id,
-                    conv_tar_path,
+                    conversation_dir,
                 )
-                return conv_tar_path
+                if trajectory_paths is not None:
+                    logger.info(
+                        "[worker] Saved trajectory files for %s to %s and %s",
+                        instance.id,
+                        trajectory_paths[0],
+                        trajectory_paths[1],
+                    )
+                return conversation_dir
 
             logger.debug(
-                "[worker] No conversation archive for %s (directory not found or empty)",
+                "[worker] No conversation files for %s (directory not found or empty)",
                 instance.id,
             )
             return None
@@ -463,44 +554,13 @@ class Evaluation(ABC, BaseModel):
         Returns:
             List of instances that need processing for this attempt
         """
-        attempt_file = os.path.join(
-            self.metadata.eval_output_dir,
-            f"output.critic_attempt_{attempt}.jsonl",
-        )
-        completed_in_attempt = get_completed_instances(attempt_file)
-
         if attempt == 1:
-            # Attempt 1: Process everything not yet completed in attempt 1
+            completed_instances = self._instances_with_non_empty_patch_and_trajectory()
             return [
-                inst for inst in all_instances if inst.id not in completed_in_attempt
+                inst for inst in all_instances if inst.id not in completed_instances
             ]
-        else:
-            # Attempt N: Retry what failed OR was missing in N-1,
-            # excluding anything already completed in this attempt.
-            prev_file = os.path.join(
-                self.metadata.eval_output_dir,
-                f"output.critic_attempt_{attempt - 1}.jsonl",
-            )
-            if not os.path.exists(prev_file):
-                return []
 
-            failed_in_prev = get_failed_instances(prev_file, critic)
-            # Collect everything completed across ALL prior attempts so that
-            # instances which passed in an earlier attempt (and therefore have
-            # no entry in later attempt files) are not mistaken for "missing".
-            all_prior_completed: set = set()
-            for a in range(1, attempt):
-                f = os.path.join(
-                    self.metadata.eval_output_dir,
-                    f"output.critic_attempt_{a}.jsonl",
-                )
-                if os.path.exists(f):
-                    all_prior_completed |= get_completed_instances(f)
-            # Instances with no entry in ANY prior attempt (never ran or
-            # crashed before producing output) should also be retried.
-            never_completed = {inst.id for inst in all_instances} - all_prior_completed
-            retry_ids = (failed_in_prev | never_completed) - completed_in_attempt
-            return [inst for inst in all_instances if inst.id in retry_ids]
+        return []
 
     def _run_iterative_mode(
         self,
@@ -890,7 +950,7 @@ class Evaluation(ABC, BaseModel):
                 self._capture_conversation_archive(workspace, instance)
             except Exception as archive_error:
                 logger.warning(
-                    "[worker] Failed to capture conversation archive for %s: %s",
+                    "[worker] Failed to capture conversation files for %s: %s",
                     instance.id,
                     archive_error,
                 )
@@ -973,39 +1033,19 @@ class Evaluation(ABC, BaseModel):
                             exc_info=True,
                         )
 
-                retry_count = 0
-                runtime_failure_count = 0
-                max_retries = self.metadata.max_retries
                 runtime_runs: list[RemoteRuntimeAllocation] = []
-
-                # max_retries is the number of *additional* attempts after the
-                # first, so total attempts = max_retries + 1 (retry_count 0..N).
-                while retry_count <= max_retries:
-                    out, failure_category = self._execute_single_attempt(
-                        instance=instance,
-                        eval_span_ctx=eval_span_ctx,
-                        critic_attempt=critic_attempt,
-                        resource_factor=self._calculate_resource_factor(
-                            runtime_failure_count
-                        ),
-                        retry_count=retry_count,
-                        max_retries=max_retries,
-                        runtime_failure_count=runtime_failure_count,
-                        runtime_runs=runtime_runs,
-                    )
-                    if out is not None:
-                        return instance, out
-
-                    # _execute_single_attempt returns (None, category) on
-                    # non-final failure.  Only escalate resource_factor for
-                    # failures that are plausibly resource-related.
-                    retry_count += 1
-                    if failure_category == FailureCategory.RESOURCE:
-                        runtime_failure_count += 1
-
-                # Unreachable: _execute_single_attempt always returns EvalOutput
-                # on the final retry, but pyright can't prove the loop exits early.
-                raise AssertionError("unreachable")  # pragma: no cover
+                out, _ = self._execute_single_attempt(
+                    instance=instance,
+                    eval_span_ctx=eval_span_ctx,
+                    critic_attempt=critic_attempt,
+                    resource_factor=self.metadata.base_resource_factor,
+                    retry_count=0,
+                    max_retries=0,
+                    runtime_failure_count=0,
+                    runtime_runs=runtime_runs,
+                )
+                assert out is not None
+                return instance, out
             finally:
                 if eval_span is not None:
                     _safe_end_span(eval_span, "eval_span")

@@ -2,13 +2,13 @@ model:
   model: azure/gpt-5.5-20260424
   api_base: https://cloudgpt-openai.azure-api.net/
   api_version: 2025-04-01-preview
-  max_output_tokens: 64000
+  max_output_tokens: 100000
   reasoning_effort: xhigh
 
 agent:
   max_iterations: 100
   timeout: 300
-  num_workers: 1
+  num_workers: 3
   workspace: docker
   output_dir: logs
   tool_preset: default

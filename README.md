@@ -1,5 +1,9 @@
 # Benchmarking OpenHands with any LLM
 
+```bash
+git clone --recursive
+```
+
 ## Prepare venv
 
 ```bash
@@ -18,6 +22,14 @@ source venv/bin/activate
 python -m pip install openai azure-identity-broker --upgrade
 ```
 
+Prepare your script to get azure_ad_token_provider at `vendor/software-agent-sdk/openhands-sdk/openhands/sdk/llm/cloudgpt_aoai.py`. Modify `llm.py` to import it as `openhands.sdk.llm.cloudgpt_aoai` and pass `azure_ad_token_provider` to LiteLLM for Azure models without an API key.
+
+If an old local agent-server image still raises `ModuleNotFoundError: cloudgpt_aoai`, rebuild it once:
+
+```bash
+FORCE_BUILD=1 python main.py ...
+```
+
 
 ## Rollout
 ```bash
@@ -33,7 +45,6 @@ nohup python main.py \
     --config config/ds4pro.yaml \
     --run-id multilang \
     --dataset datasets/multilang.jsonl \
-    --num-workers 1 \
     > log-ds4pro.out 2>&1 &
 ```
 

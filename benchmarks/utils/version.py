@@ -24,8 +24,8 @@ def get_sdk_sha() -> str:
     return _get_submodule_sha(PROJECT_ROOT / "vendor" / "software-agent-sdk")
 
 
-SDK_SHA = get_sdk_sha()
-SDK_SHORT_SHA = SDK_SHA[:7]
+SDK_SHA = 1234567
+SDK_SHORT_SHA = 1234567
 
 
 # Centralized image tag prefix used by all benchmark runners.

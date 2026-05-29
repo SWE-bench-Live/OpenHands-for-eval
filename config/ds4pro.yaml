@@ -8,7 +8,7 @@ model:
 agent:
   max_iterations: 100
   timeout: 300
-  num_workers: 1
+  num_workers: 3
   workspace: docker
   output_dir: logs
   tool_preset: default

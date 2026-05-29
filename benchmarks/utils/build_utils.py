@@ -514,10 +514,21 @@ def ensure_local_image(
     if output.error is not None:
         raise RuntimeError(f"Image build failed: {output.error}")
     if agent_server_image not in output.tags:
-        raise RuntimeError(
-            f"Built image tags {output.tags} do not include expected tag "
-            f"{agent_server_image}"
+        if not output.tags:
+            raise RuntimeError(
+                f"Built image tags {output.tags} do not include expected tag "
+                f"{agent_server_image}"
+            )
+        source_tag = output.tags[0]
+        if output.status == "skipped_remote_exists" and not local_image_exists(source_tag):
+            logger.info("Pulling remote image %s for local aliasing", source_tag)
+            subprocess.run(["docker", "pull", source_tag], check=True)
+        logger.info(
+            "Tagging built image %s as expected local image %s",
+            source_tag,
+            agent_server_image,
         )
+        subprocess.run(["docker", "tag", source_tag, agent_server_image], check=True)
     return True
 
 
