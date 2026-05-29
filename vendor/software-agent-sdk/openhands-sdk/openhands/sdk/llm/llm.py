@@ -49,6 +49,7 @@ from litellm import (
 )
 from litellm.exceptions import (
     APIConnectionError,
+    APIError,
     InternalServerError,
     RateLimitError,
     ServiceUnavailableError,
@@ -108,6 +109,7 @@ __all__ = ["LLM"]
 # Exceptions we retry on
 LLM_RETRY_EXCEPTIONS: Final[tuple[type[Exception], ...]] = (
     APIConnectionError,
+    APIError,
     RateLimitError,
     ServiceUnavailableError,
     LiteLLMTimeout,

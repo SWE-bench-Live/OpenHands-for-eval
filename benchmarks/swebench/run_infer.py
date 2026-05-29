@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import time
 from typing import Any, List
 
 from jinja2 import Environment, FileSystemLoader
@@ -72,6 +73,32 @@ def _with_fresh_azure_ad_token(llm: LLM, instance_id: str) -> LLM:
     return llm.model_copy(
         deep=True,
         update={"azure_ad_token": SecretStr(azure_ad_token)},
+    )
+
+
+def _last_conversation_error_text(conversation: Any) -> str:
+    try:
+        events = list(conversation.state.events)
+    except Exception:
+        return ""
+
+    for event in reversed(events):
+        kind = getattr(event, "kind", event.__class__.__name__)
+        if kind == "ConversationErrorEvent":
+            code = getattr(event, "code", "") or ""
+            detail = getattr(event, "detail", "") or ""
+            return f"{code}: {detail}"
+    return ""
+
+
+def _is_litellm_request_error(exc: Exception, conversation: Any) -> bool:
+    text = f"{exc}\n{_last_conversation_error_text(conversation)}"
+    return "litellm." in text and (
+        "APIError" in text
+        or "RateLimitError" in text
+        or "ServiceUnavailableError" in text
+        or "InternalServerError" in text
+        or "Timeout" in text
     )
 
 
@@ -420,8 +447,21 @@ class SWEBenchEvaluation(Evaluation):
         with workspace_keepalive(self.metadata.agent_type, workspace):
             try:
                 conversation.send_message(instruction)
-                # Run conversation with fake user responses to handle agent messages
-                run_conversation_with_fake_user_response(conversation)
+                for request_attempt in range(1, 11):
+                    try:
+                        run_conversation_with_fake_user_response(conversation)
+                        break
+                    except Exception as exc:
+                        if request_attempt == 10 or not _is_litellm_request_error(exc, conversation):
+                            raise
+                        logger.warning(
+                            "Conversation for %s hit LiteLLM request error; "
+                            "retrying run attempt %d/10 in 20s: %s",
+                            instance.id,
+                            request_attempt + 1,
+                            exc,
+                        )
+                        time.sleep(20)
             except Exception as exc:
                 run_error = exc
                 logger.warning(

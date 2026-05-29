@@ -39,10 +39,14 @@ def _agent_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "workers": "num_workers",
         "max_step": "max_iterations",
         "max_steps": "max_iterations",
+        "timeout": "instance_timeout",
     }
     for old, new in aliases.items():
         if old in agent and new not in agent:
             agent[new] = agent.pop(old)
+
+    if "instance_timeout" in agent:
+        agent["instance_timeout"] = int(agent["instance_timeout"]) * 60
 
     if agent.pop("max_attempt", None) == 1:
         agent["n_critic_runs"] = 1

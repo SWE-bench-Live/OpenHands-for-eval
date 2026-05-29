@@ -166,15 +166,17 @@ def build_eval_llm(llm: LLM, *, usage_id: str | None = None) -> LLM:
     spend for that instance. When there is no active virtual key and the
     usage_id is unchanged, the original LLM object is returned.
     """
-    updates: dict[str, object] = {}
+    updates: dict[str, object] = {
+        "num_retries": 10,
+        "retry_min_wait": 20,
+        "retry_max_wait": 20,
+        "retry_multiplier": 1,
+    }
     if usage_id is not None:
         updates["usage_id"] = usage_id
 
     virtual_key = get_current_virtual_key()
     if virtual_key is not None:
         updates["api_key"] = SecretStr(virtual_key)
-
-    if not updates:
-        return llm
 
     return llm.model_copy(deep=True, update=updates)
