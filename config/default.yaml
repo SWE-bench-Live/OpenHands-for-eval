@@ -1,9 +1,9 @@
 model:
-  model: azure/gpt-5.5-20260424
-  api_base: https://cloudgpt-openai.azure-api.net/
-  api_version: 2025-04-01-preview
+  model: azure/gpt-5.5-20260424 # please follow litellm name format
+  base_url: your_base_url
+  api_key: your_api_key
   max_output_tokens: 100000
-  reasoning_effort: xhigh
+  # other litellm args
 
 agent:
   max_iterations: 100

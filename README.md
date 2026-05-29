@@ -23,6 +23,8 @@ python -m pip install openai azure-identity-broker --upgrade
 Prepare your Python script to get function `get_azure_ad_token_provider`, say `cloudgpt_aoai.py`. Make sure `from cloudgpt_aoai import get_openai_token_provider` at `benchmarks/swebench/run_infer.py` works from this directory. The runner refreshes an Azure AD token per instance using `get_openai_token_provider()()`.
 
 ## Rollout
+Modify config/default.yaml for your setting.
+
 ```bash
 source venv/bin/activate
 FORCE_BUILD=1 python main.py \
