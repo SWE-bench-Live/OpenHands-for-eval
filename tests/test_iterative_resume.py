@@ -79,10 +79,21 @@ def _write_output(tmpdir: str, instance_id: str, patch: str) -> None:
         f.write(output.model_dump_json() + "\n")
 
 
-def _write_trajectory(tmpdir: str, instance_id: str, filename: str = "trajectory.json"):
+def _conversation_dir(tmpdir: str, instance_id: str) -> Path:
     conversation_dir = Path(tmpdir) / "conversations" / instance_id
     conversation_dir.mkdir(parents=True, exist_ok=True)
-    (conversation_dir / filename).write_text("[]\n", encoding="utf-8")
+    return conversation_dir
+
+
+def _write_trajectory(tmpdir: str, instance_id: str, filename: str = "trajectory.json"):
+    (_conversation_dir(tmpdir, instance_id) / filename).write_text("[]\n", encoding="utf-8")
+
+
+def _write_patch(tmpdir: str, instance_id: str, patch: str):
+    (_conversation_dir(tmpdir, instance_id) / "patch.diff").write_text(
+        patch,
+        encoding="utf-8",
+    )
 
 
 def test_metadata_is_clamped_to_no_retry():
@@ -104,16 +115,18 @@ def test_restart_skip_requires_non_empty_patch_and_trajectory():
         ]
         evaluation = _make_evaluation(tmpdir, instances)
 
-        _write_output(tmpdir, "A", "diff --git a/a b/a")
-        _write_trajectory(tmpdir, "A", "trajectory.jsonl")
+        _write_output(tmpdir, "A", "ignored output patch")
+        _write_patch(tmpdir, "A", "diff --git a/a b/a")
+        _write_trajectory(tmpdir, "A", "trajectory.json")
 
-        _write_output(tmpdir, "B", "diff --git a/b b/b")
+        _write_output(tmpdir, "B", "ignored output patch")
+        _write_patch(tmpdir, "B", "diff --git a/b b/b")
 
-        _write_output(tmpdir, "C", "")
-        _write_trajectory(tmpdir, "C", "trajectory.jsonl")
+        _write_patch(tmpdir, "C", "")
+        _write_trajectory(tmpdir, "C", "trajectory.json")
 
-        _write_output(tmpdir, "D", "diff --git a/d b/d")
-        _write_trajectory(tmpdir, "D", "trajectory.json")
+        _write_patch(tmpdir, "D", "diff --git a/d b/d")
+        _write_trajectory(tmpdir, "D", "trajectory.jsonl")
 
         result = evaluation._get_instances_for_attempt(
             attempt=1,
@@ -138,7 +151,64 @@ def test_later_attempts_are_disabled():
         assert result == []
 
 
-def test_trajectory_writer_creates_json_and_jsonl():
+def test_predictions_are_written_from_patch_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        evaluation = _make_evaluation(tmpdir, [])
+        _write_patch(tmpdir, "A", "diff --git a/a b/a")
+        _write_trajectory(tmpdir, "A")
+        _write_patch(tmpdir, "B", "")
+        _write_trajectory(tmpdir, "B")
+        _write_patch(tmpdir, "C", "diff --git a/c b/c")
+
+        preds_path = evaluation._write_predictions_from_patch_files()
+
+        preds = json.loads(preds_path.read_text(encoding="utf-8"))
+        assert preds == {
+            "A": {
+                "instance_id": "A",
+                "model_patch": "diff --git a/a b/a",
+            }
+        }
+
+
+def test_patch_file_is_written_from_output():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        evaluation = _make_evaluation(tmpdir, [])
+        out = EvalOutput(
+            instance_id="A",
+            test_result={"git_patch": "diff --git a/a b/a"},
+            instruction="mock",
+            error="boom",
+            history=[],
+            instance={},
+        )
+
+        patch_path = evaluation._write_patch_file(out)
+
+        assert patch_path is not None
+        assert patch_path.name == "patch.diff"
+        assert patch_path.read_text(encoding="utf-8") == "diff --git a/a b/a"
+
+
+def test_empty_patch_file_is_written_from_output():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        evaluation = _make_evaluation(tmpdir, [])
+        out = EvalOutput(
+            instance_id="A",
+            test_result={"git_patch": ""},
+            instruction="mock",
+            error="boom",
+            history=[],
+            instance={},
+        )
+
+        patch_path = evaluation._write_patch_file(out)
+
+        assert patch_path.name == "patch.diff"
+        assert patch_path.read_text(encoding="utf-8") == ""
+
+
+def test_trajectory_writer_creates_json():
     with tempfile.TemporaryDirectory() as tmpdir:
         evaluation = _make_evaluation(tmpdir, [])
         conversation_dir = Path(tmpdir) / "conversations" / "A"
@@ -149,18 +219,12 @@ def test_trajectory_writer_creates_json_and_jsonl():
             encoding="utf-8",
         )
 
-        paths = evaluation._write_trajectory_files(conversation_dir)
+        json_path = evaluation._write_trajectory_files(conversation_dir)
 
-        assert paths is not None
-        json_path, jsonl_path = paths
+        assert json_path is not None
         assert json_path.name == "trajectory.json"
-        assert jsonl_path.name == "trajectory.jsonl"
         assert json_path.stat().st_size > 0
-        assert jsonl_path.stat().st_size > 0
+        assert not (conversation_dir / "trajectory.jsonl").exists()
         assert json.loads(json_path.read_text(encoding="utf-8")) == [
             {"id": 1, "tool_name": "terminal"}
         ]
-        assert json.loads(jsonl_path.read_text(encoding="utf-8")) == {
-            "id": 1,
-            "tool_name": "terminal",
-        }

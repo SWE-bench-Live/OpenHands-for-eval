@@ -73,20 +73,22 @@ def _model_slug(model: str) -> str:
     return model.replace("/", "__")
 
 
-def _write_predictions(output_path: str, preds_path: str) -> None:
+def _write_predictions(output_dir: str, preds_path: str) -> None:
     predictions: dict[str, dict[str, str]] = {}
-    if os.path.exists(output_path):
-        with open(output_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                instance_id = row["instance_id"]
-                patch = (row.get("test_result") or {}).get("git_patch", "")
-                predictions[instance_id] = {
-                    "instance_id": instance_id,
-                    "model_patch": patch,
-                }
+    conversations_dir = Path(output_dir) / "conversations"
+    if conversations_dir.is_dir():
+        for patch_path in sorted(conversations_dir.glob("*/patch.diff")):
+            trajectory_path = patch_path.parent / "trajectory.json"
+            if not trajectory_path.is_file() or trajectory_path.stat().st_size == 0:
+                continue
+            patch = patch_path.read_text(encoding="utf-8")
+            if not patch.strip():
+                continue
+            instance_id = patch_path.parent.name
+            predictions[instance_id] = {
+                "instance_id": instance_id,
+                "model_patch": patch,
+            }
 
     with open(preds_path, "w", encoding="utf-8") as f:
         json.dump(predictions, f, indent=2)
@@ -162,7 +164,7 @@ def main(argv: list[str] | None = None) -> None:
     evaluator.run(on_result=get_default_on_result_writer(evaluator.output_path))
 
     preds_path = os.path.join(output_dir, "preds.json")
-    _write_predictions(evaluator.output_path, preds_path)
+    _write_predictions(output_dir, preds_path)
 
     logger.info("Evaluation completed!")
     print(json.dumps({"output_json": evaluator.output_path, "preds_json": preds_path}))

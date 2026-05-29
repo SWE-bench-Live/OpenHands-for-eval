@@ -365,7 +365,7 @@ class ExecuteBashRequest(BaseModel):
     command: str = Field(description="The bash command to execute")
     cwd: str | None = Field(default=None, description="The current working directory")
     timeout: int = Field(
-        default=300,
+        default=3600,
         description="The max number of seconds a command may be permitted to run.",
     )
 

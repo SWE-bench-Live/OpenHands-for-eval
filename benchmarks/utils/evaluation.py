@@ -206,41 +206,62 @@ class Evaluation(ABC, BaseModel):
     def output_path(self) -> str:
         return os.path.join(self.metadata.eval_output_dir, OUTPUT_FILENAME)
 
+    def _conversation_dir(self, instance_id: str) -> Path:
+        return Path(self.metadata.eval_output_dir) / "conversations" / instance_id
+
     def _trajectory_exists(self, instance_id: str) -> bool:
-        trajectory_path = (
-            Path(self.metadata.eval_output_dir)
-            / "conversations"
-            / instance_id
-            / "trajectory.jsonl"
-        )
+        trajectory_path = self._conversation_dir(instance_id) / "trajectory.json"
         return trajectory_path.is_file() and trajectory_path.stat().st_size > 0
+
+    def _patch_path(self, instance_id: str) -> Path:
+        return self._conversation_dir(instance_id) / "patch.diff"
+
+    def _read_patch(self, instance_id: str) -> str:
+        patch_path = self._patch_path(instance_id)
+        if not patch_path.is_file() or patch_path.stat().st_size == 0:
+            return ""
+        return patch_path.read_text(encoding="utf-8")
+
+    def _write_patch_file(self, out: EvalOutput) -> Path:
+        patch = (out.test_result or {}).get("git_patch") or ""
+        conversation_dir = self._conversation_dir(out.instance_id)
+        conversation_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = conversation_dir / "patch.diff"
+        patch_path.write_text(patch, encoding="utf-8")
+        return patch_path
+
+    def _write_predictions_from_patch_files(self) -> Path:
+        predictions: dict[str, dict[str, str]] = {}
+        conversations_dir = Path(self.metadata.eval_output_dir) / "conversations"
+        if conversations_dir.is_dir():
+            for patch_path in sorted(conversations_dir.glob("*/patch.diff")):
+                instance_id = patch_path.parent.name
+                patch = self._read_patch(instance_id)
+                if not patch.strip() or not self._trajectory_exists(instance_id):
+                    continue
+                predictions[instance_id] = {
+                    "instance_id": instance_id,
+                    "model_patch": patch,
+                }
+
+        preds_path = Path(self.metadata.eval_output_dir) / "preds.json"
+        with preds_path.open("w", encoding="utf-8") as f:
+            json.dump(predictions, f, indent=2)
+        return preds_path
 
     def _instances_with_non_empty_patch_and_trajectory(self) -> set[EvalInstanceID]:
         completed_instances: set[EvalInstanceID] = set()
-        if os.path.exists(self.output_path):
-            with open(self.output_path, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f, 1):
-                    if not line.strip():
-                        continue
-                    try:
-                        out = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        logger.warning(
-                            "Invalid JSON on line %d in %s: %s",
-                            line_num,
-                            self.output_path,
-                            exc,
-                        )
-                        continue
-                    instance_id = out.get("instance_id")
-                    patch = (out.get("test_result") or {}).get("git_patch") or ""
-                    if instance_id and patch.strip() and self._trajectory_exists(instance_id):
-                        completed_instances.add(instance_id)
-            logger.info(
-                "Found %d restart-complete instances in %s",
-                len(completed_instances),
-                self.output_path,
-            )
+        conversations_dir = Path(self.metadata.eval_output_dir) / "conversations"
+        if conversations_dir.is_dir():
+            for patch_path in sorted(conversations_dir.glob("*/patch.diff")):
+                instance_id = patch_path.parent.name
+                if self._read_patch(instance_id).strip() and self._trajectory_exists(instance_id):
+                    completed_instances.add(instance_id)
+        logger.info(
+            "Found %d restart-complete instances in %s",
+            len(completed_instances),
+            conversations_dir,
+        )
         return completed_instances
 
     def _get_completed_instances(self) -> set[EvalInstanceID]:
@@ -315,8 +336,8 @@ class Evaluation(ABC, BaseModel):
                 raise RuntimeError(f"Unsafe conversation archive member: {member.name}")
         conv_tar.extractall(target_dir, filter="data")
 
-    def _write_trajectory_files(self, conversation_dir: Path) -> tuple[Path, Path] | None:
-        """Write persisted event JSON files to JSON and JSONL trajectory files."""
+    def _write_trajectory_files(self, conversation_dir: Path) -> Path | None:
+        """Write persisted event JSON files to a trajectory JSON array."""
         event_paths = sorted(conversation_dir.rglob("events/event-*.json"))
         if not event_paths:
             return None
@@ -326,14 +347,9 @@ class Evaluation(ABC, BaseModel):
             events.append(json.loads(event_path.read_text()))
 
         json_path = conversation_dir / "trajectory.json"
-        jsonl_path = conversation_dir / "trajectory.jsonl"
         with json_path.open("w", encoding="utf-8") as out_file:
             json.dump(events, out_file, indent=2)
-        with jsonl_path.open("w", encoding="utf-8") as out_file:
-            for event in events:
-                out_file.write(json.dumps(event))
-                out_file.write("\n")
-        return json_path, jsonl_path
+        return json_path
 
     def _has_meaningful_metrics(self, metrics: Metrics) -> bool:
         """Return whether recovered metrics contain non-zero cost or usage."""
@@ -477,19 +493,18 @@ class Evaluation(ABC, BaseModel):
                 tar_bytes = base64.b64decode(tar_cmd.stdout)
                 with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as conv_tar:
                     self._safe_extract_tar(conv_tar, conversation_dir)
-                trajectory_paths = self._write_trajectory_files(conversation_dir)
+                trajectory_path = self._write_trajectory_files(conversation_dir)
 
                 logger.info(
                     "[worker] Saved conversation files for %s to %s",
                     instance.id,
                     conversation_dir,
                 )
-                if trajectory_paths is not None:
+                if trajectory_path is not None:
                     logger.info(
-                        "[worker] Saved trajectory files for %s to %s and %s",
+                        "[worker] Saved trajectory file for %s to %s",
                         instance.id,
-                        trajectory_paths[0],
-                        trajectory_paths[1],
+                        trajectory_path,
                     )
                 return conversation_dir
 
@@ -663,6 +678,8 @@ class Evaluation(ABC, BaseModel):
             instances_to_process = self._get_instances_for_attempt(
                 attempt, all_instances, critic
             )
+            if attempt == 1:
+                self._write_predictions_from_patch_files()
 
             logger.info(f"Processing {len(instances_to_process)} instances")
 
@@ -696,6 +713,15 @@ class Evaluation(ABC, BaseModel):
                         logger.warning(
                             f"Failed to write to attempt file {attempt_file}: {e}"
                         )
+
+                patch_path = self._write_patch_file(out)
+                if patch_path is not None:
+                    logger.info(
+                        "[worker] Saved patch for %s to %s",
+                        instance.id,
+                        patch_path,
+                    )
+                self._write_predictions_from_patch_files()
 
                 # Call original callback if provided
                 if on_result:

@@ -400,7 +400,8 @@ class SWEBenchEvaluation(Evaluation):
                     f"sudo chown -R $(id -u):$(id -g) {quoted_repo_path}",
                     f"sudo chmod -R u+rwX {quoted_repo_path}",
                 ]
-            )
+            ),
+            timeout=600,
         )
         assert cp_testbed_repo.exit_code == 0, (
             f"cp_testbed_repo failed: {cp_testbed_repo.stderr}"
@@ -438,7 +439,7 @@ class SWEBenchEvaluation(Evaluation):
 
         git_add = workspace.execute_command(f"cd {repo_path} ; git add -A")
         if git_add.exit_code != 0:
-            patch_error = f"git add failed: {git_add.stderr}"
+            patch_error = f"git add failed: {git_add.stderr or git_add.stdout}"
             logger.warning("%s: %s", instance.id, patch_error)
 
         if patch_error is None:
@@ -449,13 +450,25 @@ class SWEBenchEvaluation(Evaluation):
                 f"git commit --no-verify -m '{constants.GIT_COMMIT_MESSAGE}'"
             )
             if commit_result.exit_code != 0:
-                patch_error = f"git commit failed: {commit_result.stderr}"
+                patch_error = f"git commit failed: {commit_result.stderr or commit_result.stdout}"
                 logger.warning("%s: %s", instance.id, patch_error)
 
         base_commit = instance.data["base_commit"]
-        git_patch_result = workspace.execute_command(
-            f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD --"
-        )
+        if patch_error is None:
+            git_patch_result = workspace.execute_command(
+                f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD --"
+            )
+        else:
+            fallback_git_add = workspace.execute_command(f"cd {repo_path} ; git add -A")
+            if fallback_git_add.exit_code != 0:
+                fallback_add_error = (
+                    f"fallback git add failed: {fallback_git_add.stderr or fallback_git_add.stdout}"
+                )
+                logger.warning("%s: %s", instance.id, fallback_add_error)
+                patch_error = f"{patch_error}; {fallback_add_error}"
+            git_patch_result = workspace.execute_command(
+                f"cd {repo_path} ; git --no-pager diff --no-color HEAD"
+            )
         if git_patch_result.exit_code == 0:
             git_patch = git_patch_result.stdout
         else:
